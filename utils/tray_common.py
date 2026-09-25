@@ -11,6 +11,7 @@ import threading
 import time
 from pathlib import Path
 from typing import Any, Callable, Dict, Optional, Tuple
+from copy import deepcopy
 
 import psutil
 
@@ -211,7 +212,7 @@ def load_config() -> dict:
         except Exception as exc:
             log.warning("Failed to load config: %s", repr(exc))
     if cfg is None:
-        cfg = dict(DEFAULT_CONFIG)
+        cfg = deepcopy(DEFAULT_CONFIG)
     _apply_ui_language(cfg)
     return cfg
 
