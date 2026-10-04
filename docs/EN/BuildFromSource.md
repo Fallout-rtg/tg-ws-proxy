@@ -49,6 +49,7 @@ tg-ws-proxy [--port PORT] [--host HOST] [--dc-ip DC:IP ...] [-v]
 | `--secret` | `random` | 32-character hex key for client authorization |
 | `--dc-ip` | `2:149.154.167.220`, `4:149.154.167.220` | Target IP for DC (can be specified multiple times) |
 | `--no-cfproxy` | `false` | Disable [Cloudflare proxying](./CfProxy.md) attempts |
+| `--no-h2` | `false` | Disable HTTP/2 media multiplexing through CF proxy |
 | `--cfproxy-domain` | | Specify your own domain for Cloudflare proxying [Learn more](./CfProxy.md). Can be specified multiple times. |
 | `--cfproxy-worker-domain` | | Cloudflare Worker domain [Learn more](./CfWorker.md). Can be specified multiple times. |
 | `--no-secure` | `false` | Use 80 port for CF-proxy and CF-worker connections |

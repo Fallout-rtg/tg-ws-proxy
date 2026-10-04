@@ -1,6 +1,7 @@
 import asyncio
 import logging
 import struct
+import time
 
 from typing import List, Optional
 from urllib.parse import urlencode
@@ -12,6 +13,8 @@ from .config import proxy_config
 from .raw_websocket import RawWebSocket
 from .pool import cf_worker_pool
 from ._aes import Cipher, algorithms, modes
+from .network_debug import WsActivity
+from .cf_h2 import bridge_h2
 
 
 log = logging.getLogger('tg-mtproto-proxy')
@@ -130,7 +133,7 @@ class MsgSplitter:
 
 async def do_fallback(reader, writer, relay_init, label,
                        dc: int, is_test_dc: bool, is_media: bool, media_tag: str,
-                       ctx: CryptoCtx, splitter=None):
+                       ctx: CryptoCtx, splitter=None, *, h2_pool=None, proto_tag=None):
     ip_table = DC_TEST_IPS if is_test_dc else DC_DEFAULT_IPS
     fallback_dst = ip_table.get(dc)
     use_cf = proxy_config.fallback_cfproxy and not is_test_dc
@@ -154,6 +157,13 @@ async def do_fallback(reader, writer, relay_init, label,
             if ok:
                 return True
         elif method == 'cf':
+            if is_media and h2_pool is not None and proto_tag is not None:
+                channel = await h2_pool.open(dc, label)
+                if channel is not None:
+                    stats.connections_h2 += 1
+                    stats.connections_cfproxy += 1
+                    await bridge_h2(reader, writer, channel, ctx, proto_tag)
+                    return True
             ok = await _cfproxy_fallback(
                 reader, writer, relay_init, label, ctx,
                 dc=dc, is_media=is_media,
@@ -231,6 +241,7 @@ async def _cfproxy_fallback(reader, writer, relay_init, label,
 
     log.info("[%s] DC%d%s -> trying CF proxy",
             label, dc, media_tag)
+    connect_started = time.monotonic()
 
     for base_domain in balancer.get_domains_for_dc(dc):
         domain = f'kws{dc}.{base_domain}'
@@ -246,6 +257,8 @@ async def _cfproxy_fallback(reader, writer, relay_init, label,
     if ws is None:
         return False
 
+    log.debug('[%s] WS CONNECT DC%d%s route=cf setup_ms=%.0f',
+              label, dc, media_tag, (time.monotonic() - connect_started) * 1000)
     if chosen_domain and balancer.update_domain_for_dc(dc, chosen_domain):
         log.info("[%s] Switched active CF domain", label)
 
@@ -290,6 +303,7 @@ async def bridge_ws_reencrypt(reader, writer, ws: RawWebSocket, label,
     down_packets = 0
     start_time = asyncio.get_running_loop().time()
     close_reason = 'normal'
+    activity = WsActivity(label, dc_tag) if log.isEnabledFor(logging.DEBUG) else None
 
     async def tcp_to_ws():
         nonlocal up_bytes, up_packets, close_reason
@@ -300,9 +314,15 @@ async def bridge_ws_reencrypt(reader, writer, ws: RawWebSocket, label,
                     if splitter:
                         tail = splitter.flush()
                         if tail:
+                            if activity is not None:
+                                activity.send_started()
                             await ws.send(tail[0])
+                            if activity is not None:
+                                activity.sent(len(tail[0]))
                     break
                 n = len(chunk)
+                if activity is not None:
+                    activity.input(n)
                 stats.bytes_up += n
                 up_bytes += n
                 up_packets += 1
@@ -312,12 +332,20 @@ async def bridge_ws_reencrypt(reader, writer, ws: RawWebSocket, label,
                     parts = splitter.split(chunk)
                     if not parts:
                         continue
+                    if activity is not None:
+                        activity.send_started()
                     if len(parts) > 1:
                         await ws.send_batch(parts)
                     else:
                         await ws.send(parts[0])
+                    if activity is not None:
+                        activity.sent(sum(map(len, parts)))
                 else:
+                    if activity is not None:
+                        activity.send_started()
                     await ws.send(chunk)
+                    if activity is not None:
+                        activity.sent(len(chunk))
         except asyncio.CancelledError:
             return
         except (ConnectionError, OSError) as e:
@@ -336,6 +364,8 @@ async def bridge_ws_reencrypt(reader, writer, ws: RawWebSocket, label,
                         close_reason = 'upstream: ws_close'
                     break
                 n = len(data)
+                if activity is not None:
+                    activity.received(n)
                 stats.bytes_down += n
                 down_bytes += n
                 down_packets += 1
@@ -343,6 +373,8 @@ async def bridge_ws_reencrypt(reader, writer, ws: RawWebSocket, label,
                 data = ctx.clt_enc.update(plain)
                 writer.write(data)
                 await writer.drain()
+                if activity is not None:
+                    activity.delivered(n)
         except asyncio.CancelledError:
             return
         except (ConnectionError, OSError) as e:
@@ -366,6 +398,8 @@ async def bridge_ws_reencrypt(reader, writer, ws: RawWebSocket, label,
             except BaseException:
                 pass
         elapsed = asyncio.get_running_loop().time() - start_time
+        if activity is not None:
+            activity.close()
         log.info("[%s] %s WS session closed (%s): "
                  "^%s (%d pkts) v%s (%d pkts) in %.1fs",
                  label, dc_tag, close_reason,

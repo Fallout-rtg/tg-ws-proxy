@@ -358,6 +358,7 @@ def apply_proxy_config(cfg: dict) -> bool:
     pc.buffer_size = max(4, cfg.get("buf_kb", DEFAULT_CONFIG["buf_kb"])) * 1024
     pc.pool_size = max(0, cfg.get("pool_size", DEFAULT_CONFIG["pool_size"]))
     pc.fallback_cfproxy = cfg.get("cfproxy", DEFAULT_CONFIG["cfproxy"])
+    pc.cfproxy_h2_media = cfg.get("h2", DEFAULT_CONFIG["h2"])
     cfproxy_user_domains = coerce_domain_list(
         cfg.get("cfproxy_user_domain", DEFAULT_CONFIG["cfproxy_user_domain"])
     )

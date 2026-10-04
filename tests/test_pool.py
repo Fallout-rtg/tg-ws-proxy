@@ -20,6 +20,24 @@ def _open_ws():
 
 
 class WsPoolRotationTest(unittest.IsolatedAsyncioTestCase):
+    async def test_warmup_preserves_media_ws_with_or_without_h2(self):
+        for cf, secure, opted_out, media in [(True, True, False, True),
+                                            (False, True, False, True),
+                                            (True, False, False, True),
+                                            (True, True, True, True)]:
+            with self.subTest(cf=cf, secure=secure, opted_out=opted_out), \
+                    mock.patch.object(proxy_config, 'dc_redirects', {2: '149.154.167.220'}), \
+                    mock.patch.object(proxy_config, 'fallback_cfproxy', cf), \
+                    mock.patch.object(proxy_config, 'disable_secure', not secure), \
+                    mock.patch.object(proxy_config, 'cfproxy_h2_media', not opted_out), \
+                    mock.patch.object(proxy_config, 'force_test_dc', False):
+                pool = _WsPool()
+                with mock.patch.object(pool, '_schedule_refill') as refill:
+                    await pool.warmup()
+                keys = [call.args[0] for call in refill.call_args_list]
+                self.assertIn((2, False), keys)
+                self.assertEqual((2, True) in keys, media)
+
     async def test_refills_partially_populated_bucket(self):
         pool = _WsPool()
         key = (2, False)

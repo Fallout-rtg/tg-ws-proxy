@@ -8,7 +8,6 @@ import asyncio
 import hashlib
 import argparse
 import logging
-import logging.handlers
 import socket as _socket
 
 from typing import Dict, Optional, Set, Tuple
@@ -28,6 +27,8 @@ from .raw_websocket import RawWebSocket, WsHandshakeError, set_sock_opts
 from .fake_tls import proxy_to_masking_domain, verify_client_hello, build_server_hello, FakeTlsStream, TLS_RECORD_HANDSHAKE
 from .balancer import balancer
 from .pool import ws_pool, cf_worker_pool
+from .cf_h2 import CfH2Pool
+from .network_debug import log_ws_flow
 from ._aes import Cipher, algorithms, modes
 
 
@@ -41,6 +42,7 @@ LISTENER_RESTART_DELAY = 1.0
 ws_blacklist: Set[str] = set()
 dc_fail_until: Dict[str, float] = {}
 ip_fail_until: Dict[str, float] = {}
+cf_h2_pool: Optional[CfH2Pool] = None
 
 
 def _try_handshake(handshake: bytes, secret: bytes) -> Optional[Tuple[int, bool, bytes, bytes]]:
@@ -338,7 +340,7 @@ async def _handle_client(reader, writer, secret: bytes):
                 ok = await do_fallback(
                     clt_reader, clt_writer, relay_init, label,
                     dc, is_test_dc, is_media, media_tag,
-                    ctx, splitter=splitter)
+                    ctx, splitter=splitter, h2_pool=cf_h2_pool, proto_tag=proto_tag)
                 if not ok:
                     log.warning("[%s] DC%d%s no fallback available",
                                 label, dc, media_tag)
@@ -417,7 +419,7 @@ async def _handle_client(reader, writer, secret: bytes):
             ok = await do_fallback(
                 clt_reader, clt_writer, relay_init, label,
                 dc, is_test_dc, is_media, media_tag,
-                ctx, splitter=splitter_fb)
+                ctx, splitter=splitter_fb, h2_pool=cf_h2_pool, proto_tag=proto_tag)
             if ok:
                 log.info("[%s] DC%d%s fallback closed",
                          label, dc, media_tag)
@@ -471,7 +473,7 @@ _client_tasks: Set[asyncio.Task] = set()
 
 
 async def _run(stop_event: Optional[asyncio.Event] = None):
-    global _server_instance, _server_stop_event
+    global _server_instance, _server_stop_event, cf_h2_pool
     _server_stop_event = stop_event
 
     ws_pool.reset()
@@ -480,6 +482,7 @@ async def _run(stop_event: Optional[asyncio.Event] = None):
     dc_fail_until.clear()
     ip_fail_until.clear()
     _client_tasks.clear()
+    cf_h2_pool = CfH2Pool() if proxy_config.h2_enabled else None
 
     user_cf_domains = proxy_config.cfproxy_user_domains
     if user_cf_domains:
@@ -488,8 +491,12 @@ async def _run(stop_event: Optional[asyncio.Event] = None):
         start_cfproxy_domain_refresh()
 
     secret_bytes = bytes.fromhex(proxy_config.secret)
+    stopping = False
 
     def client_cb(r, w):
+        if stopping:
+            w.close()
+            return
         task = asyncio.create_task(_handle_client(r, w, secret_bytes))
         _client_tasks.add(task)
         task.add_done_callback(_client_tasks.discard)
@@ -531,6 +538,8 @@ async def _run(stop_event: Optional[asyncio.Event] = None):
     if proxy_config.cfproxy_worker_domains:
         log.info("  CF worker:     enabled (%s)",
                  ", ".join(proxy_config.cfproxy_worker_domains))
+    if cf_h2_pool is not None:
+        log.info('  CF H2 media:   enabled')
     if proxy_config.disable_secure:
         log.info("  No secure:     enabled (port 80 for CF proxy/worker)")
     log.info("=" * 60)
@@ -542,11 +551,26 @@ async def _run(stop_event: Optional[asyncio.Event] = None):
     log.info("=" * 60)
 
     async def log_stats():
+        next_stats = time.monotonic() + 60
+        next_tick = time.monotonic() + 5
         try:
             while True:
-                await asyncio.sleep(60)
+                await asyncio.sleep(5)
+                now = time.monotonic()
+                if log.isEnabledFor(logging.DEBUG):
+                    if now - next_tick >= .25:
+                        log.debug('NET LOOP late_ms=%.0f', (now - next_tick) * 1000)
+                    log_ws_flow(now)
+                    if cf_h2_pool is not None:
+                        cf_h2_pool.log_flow(now)
+                next_tick = time.monotonic() + 5
+                if now < next_stats:
+                    continue
+                next_stats = now + 60
                 bl = ', '.join(f'DC{k}' for k in sorted(ws_blacklist)) or 'none'
                 log.info("stats: %s | ws_bl: %s", stats.summary(), bl)
+                if cf_h2_pool is not None:
+                    cf_h2_pool.log_stats()
         except asyncio.CancelledError:
             raise
 
@@ -563,6 +587,7 @@ async def _run(stop_event: Optional[asyncio.Event] = None):
         except (asyncio.CancelledError, Exception):
             pass
 
+    serve_task = stop_task = watchdog_task = None
     try:
         while True:
             serve_task = asyncio.create_task(server.serve_forever())
@@ -585,19 +610,12 @@ async def _run(stop_event: Optional[asyncio.Event] = None):
                 waiters, return_when=asyncio.FIRST_COMPLETED)
 
             if stop_task is not None and stop_task in done:
-                for task in list(_client_tasks):
-                    task.cancel()
-                if _client_tasks:
-                    await asyncio.gather(
-                        *_client_tasks, return_exceptions=True)
-                await _quiet_cancel(watchdog_task)
-                await _quiet_cancel(serve_task)
-                server.close()
-                await server.wait_closed()
                 break
 
             await _quiet_cancel(watchdog_task)
             await _quiet_cancel(serve_task)
+            if stop_task is not None:
+                await _quiet_cancel(stop_task)
             log.warning(
                 "Listening socket died, restarting server")
             server.close()
@@ -622,6 +640,20 @@ async def _run(stop_event: Optional[asyncio.Event] = None):
             log.warning("Server restored, listening on %s:%d",
                         proxy_config.host, proxy_config.port)
     finally:
+        stopping = True
+        server.close()
+        clients = list(_client_tasks)
+        for task in clients:
+            task.cancel()
+        await asyncio.gather(*clients, return_exceptions=True)
+        for task in (serve_task, watchdog_task, stop_task):
+            if task is not None:
+                await _quiet_cancel(task)
+        await server.wait_closed()
+        if cf_h2_pool is not None:
+            await cf_h2_pool.close()
+            cf_h2_pool = None
+        _server_instance = _server_stop_event = None
         log_stats_task.cancel()
         try:
             await log_stats_task
@@ -666,13 +698,17 @@ def main():
                     help='WS connection pool size per DC (default 4, min 0)')
     ap.add_argument('--cfproxy-domain', action='append', default=None,
                     metavar='DOMAIN',
-                    help='User defined Cloudflare-proxied domain for WS fallback '
+                    help='User defined Cloudflare-proxied domain for H2 media and WS fallback '
                          '(repeatable for multiple domains)')
     ap.add_argument('--cfproxy-worker-domain', action='append', default=None,
                     metavar='DOMAIN',
                     help='Cloudflare Worker domain for WS fallback '
                          '(tried before other fallback methods, '
                          'repeatable for multiple domains)')
+    h2_flags = ap.add_mutually_exclusive_group()
+    h2_flags.add_argument('--no-h2', action='store_true',
+                         help='Disable HTTP/2 multiplexing for CF media (enabled by default)')
+    h2_flags.add_argument('--cfproxy-h2-media', action='store_true', help=argparse.SUPPRESS)
     ap.add_argument('--no-cfproxy', action='store_true',
                     help='Disable Cloudflare proxy fallback')
     ap.add_argument('--no-secure', action='store_true',
@@ -728,6 +764,7 @@ def main():
     proxy_config.fallback_cfproxy = not args.no_cfproxy
     proxy_config.cfproxy_user_domains = coerce_domain_list(args.cfproxy_domain)
     proxy_config.cfproxy_worker_domains = coerce_domain_list(args.cfproxy_worker_domain)
+    proxy_config.cfproxy_h2_media = not args.no_h2
     proxy_config.disable_secure = args.no_secure
     proxy_config.fake_tls_domain = args.fake_tls_domain.strip()
     proxy_config.proxy_protocol = args.proxy_protocol
@@ -756,6 +793,8 @@ def main():
         root.addHandler(fh)
 
     logging.getLogger('asyncio').setLevel(logging.WARNING)
+    logging.getLogger('httpx').setLevel(logging.WARNING)
+    logging.getLogger('httpcore').setLevel(logging.WARNING)
 
     try:
         asyncio.run(_run())
