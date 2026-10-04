@@ -49,7 +49,7 @@
   "tip.verbose": "When enabled, more details are written to the log file — useful for troubleshooting",
   "tip.no_secure": "When enabled, the proxy will use port 80 for CF-proxy and CF-worker connections",
   "tip.buf_kb": "Receive/send buffer size in kilobytes.\nA larger value allocates more memory per socket",
-  "tip.pool": "How many parallel WebSocket sessions per data center can be kept open.\nIncreasing may help under high load",
+  "tip.pool": "How many ready WebSocket connections to keep per data center.\n0 disables the direct DC->IP WebSocket route",
   "tip.log_mb": "Maximum log file size; the file is overwritten when the limit is reached",
   "tip.autostart": "Launch TG WS Proxy on Windows login. If you move the app to another folder, autostart will reset",
   "tip.check_updates": "Check for updates on startup",

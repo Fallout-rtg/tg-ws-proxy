@@ -56,7 +56,7 @@ tg-ws-proxy [--port PORT] [--host HOST] [--dc-ip DC:IP ...] [-v]
 | `--fake-tls-domain` | | Enable Fake TLS masquerading (ee-secret) with specified SNI domain |
 | `--proxy-protocol` | disabled | Accept HAProxy PROXY protocol v1 (for use behind nginx/haproxy with `proxy_protocol on`) |
 | `--buf-kb` | `256` | Buffer size in KB |
-| `--pool-size` | `4` | Number of pre-allocated connections per DC |
+| `--pool-size` | `4` | Number of ready WS connections per DC. `0` disables the direct DC→IP WS route |
 | `--log-file` | disabled | Path to file for saving logs |
 | `--log-max-mb` | `5` | Maximum log file size in MB (afterwards overwrites) |
 | `--log-backups` | `0` | Number of log backups after overwrite |

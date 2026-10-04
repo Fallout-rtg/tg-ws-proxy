@@ -3,7 +3,7 @@ import logging
 import struct
 import time
 
-from typing import List, Optional
+from typing import Dict, List, Optional, Set, Tuple
 from urllib.parse import urlencode
 
 from .utils import *
@@ -19,6 +19,18 @@ from .cf_h2 import bridge_h2
 
 log = logging.getLogger('tg-mtproto-proxy')
 _st_I_le = struct.Struct('<I')
+
+TCP_BACKOFF_INITIAL = 30.0
+TCP_BACKOFF_MAX = 3600.0
+_tcp_failures: Dict[Tuple[str, int], int] = {}
+_tcp_retry_after: Dict[Tuple[str, int], float] = {}
+_tcp_connecting: Set[Tuple[str, int]] = set()
+
+
+def reset_tcp_backoff() -> None:
+    _tcp_failures.clear()
+    _tcp_retry_after.clear()
+    _tcp_connecting.clear()
 
 ZERO_64 = b'\x00' * 64
 
@@ -171,8 +183,6 @@ async def do_fallback(reader, writer, relay_init, label,
             if ok:
                 return True
         elif method == 'tcp' and fallback_dst:
-            log.info("[%s] DC%d%s -> TCP fallback to %s:443",
-                     label, dc, media_tag, fallback_dst)
             ok = await _tcp_fallback(
                 reader, writer, fallback_dst, 443,
                 relay_init, label, ctx)
@@ -271,19 +281,45 @@ async def _cfproxy_fallback(reader, writer, relay_init, label,
 
 
 async def _tcp_fallback(reader, writer, dst, port, relay_init, label, ctx: CryptoCtx):
-    try:
-        rr, rw = await asyncio.wait_for(
-            asyncio.open_connection(dst, port), timeout=10)
-    except Exception as exc:
-        log.warning("[%s] TCP fallback to %s:%d failed: %s",
-                    label, dst, port, repr(exc))
+    key = (dst, port)
+    if key in _tcp_connecting or time.monotonic() < _tcp_retry_after.get(key, 0):
+        log.debug("[%s] TCP fallback to %s:%d skipped (backoff or connecting)",
+                  label, dst, port)
         return False
 
-    stats.connections_tcp_fallback += 1
-    rw.write(relay_init)
-    await rw.drain()
-    await _bridge_tcp_reencrypt(reader, writer, rr, rw, label, ctx)
-    return True
+    _tcp_connecting.add(key)
+    rw = None
+    try:
+        try:
+            log.info("[%s] TCP fallback to %s:%d", label, dst, port)
+            rr, rw = await asyncio.wait_for(
+                asyncio.open_connection(dst, port), timeout=10)
+            rw.write(relay_init)
+            await rw.drain()
+        except Exception as exc:
+            failures = _tcp_failures.get(key, 0) + 1
+            _tcp_failures[key] = failures
+            delay = min(TCP_BACKOFF_INITIAL * 2 ** min(failures - 1, 7),
+                        TCP_BACKOFF_MAX)
+            _tcp_retry_after[key] = time.monotonic() + delay
+            log.warning("[%s] TCP fallback to %s:%d failed: %r; retry in %.0fs",
+                        label, dst, port, exc, delay)
+            return False
+        finally:
+            _tcp_connecting.discard(key)
+
+        _tcp_failures.pop(key, None)
+        _tcp_retry_after.pop(key, None)
+        stats.connections_tcp_fallback += 1
+        await _bridge_tcp_reencrypt(reader, writer, rr, rw, label, ctx)
+        return True
+    finally:
+        if rw is not None:
+            rw.close()
+            try:
+                await rw.wait_closed()
+            except (OSError, ConnectionError):
+                pass
 
 
 async def bridge_ws_reencrypt(reader, writer, ws: RawWebSocket, label,
