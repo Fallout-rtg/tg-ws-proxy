@@ -155,15 +155,74 @@ class HttpMultiplexTest(unittest.IsolatedAsyncioTestCase):
         calls = []
         async def handler(request):
             calls.append(request.content)
-            return httpx.Response(403, extensions={'http_version': b'HTTP/2'})
+            return httpx.Response(503, extensions={'http_version': b'HTTP/2'})
         self._transport(handler)
         channel = self._channel()
         await channel.send(b'x' * 40, False)
-        with self.assertRaisesRegex(ConnectionError, '403'):
+        with self.assertRaisesRegex(ConnectionError, '503'):
             await asyncio.wait_for(channel.receive(), 1)
         self.assertEqual(calls, [b'x' * 40])
         self.assertTrue(channel.closed)
         self.assertFalse(self.lane.closed)
+
+    async def test_transport_error_reaches_client_before_close_without_cooling_domain(self):
+        class ErrorBody(httpx.AsyncByteStream):
+            async def __aiter__(self):
+                raise AssertionError('HTTP transport error bodies must be ignored')
+                yield b''
+
+        for tag in (PROTO_TAG_ABRIDGED, PROTO_TAG_INTERMEDIATE, PROTO_TAG_SECURE):
+            for status in (403, 404, 429, 444):
+                with self.subTest(tag=tag, status=status):
+                    calls = []
+
+                    def handler(request):
+                        calls.append(request.content)
+                        if request.content == b'h' * 40:
+                            return httpx.Response(200, content=b'r' * 40,
+                                                  extensions={'http_version': b'HTTP/2'})
+                        return httpx.Response(status, stream=ErrorBody(),
+                                              headers={'content-type': 'text/html'},
+                                              extensions={'http_version': b'HTTP/2'})
+
+                    self._transport(handler)
+                    channel = self._channel()
+                    output = bytearray()
+                    draining, release = asyncio.Event(), asyncio.Event()
+
+                    async def drain():
+                        draining.set()
+                        await release.wait()
+
+                    writer = SimpleNamespace(write=output.extend, drain=drain)
+                    reader = asyncio.StreamReader()
+                    packet = b'k' * 40
+                    reader.feed_data(_encode_reply(packet, tag))
+                    ctx = SimpleNamespace(clt_enc=_IdentityCipher(), clt_dec=_IdentityCipher())
+                    task = asyncio.create_task(bridge_h2(reader, writer, channel, ctx, tag))
+                    try:
+                        await asyncio.wait_for(draining.wait(), 1)
+                        self.assertFalse(task.done())
+                        self.assertFalse(channel.close_done)
+                        if tag == PROTO_TAG_ABRIDGED:
+                            self.assertEqual(output, b'\x01' + struct.pack('<i', -status))
+                        else:
+                            length, = struct.unpack('<I', output[:4])
+                            self.assertEqual(length, len(output) - 4)
+                            self.assertEqual(output[4:8], struct.pack('<i', -status))
+                            self.assertLessEqual(length, 7)
+                        self.assertEqual(self.lane.failed_until, 0)
+                        healthy = self._channel()
+                        await healthy.send(b'h' * 40, False)
+                        self.assertEqual(await asyncio.wait_for(healthy.receive(), 1), b'r' * 40)
+                        self.assertEqual(calls, [packet, b'h' * 40])
+                        self.assertFalse(self.lane.closed)
+                    finally:
+                        release.set()
+                        await asyncio.wait_for(task, 1)
+                    self.assertTrue(channel.close_done)
+                    self.assertFalse(channel.pending)
+                    await healthy.close()
 
     async def test_long_polls_cannot_block_fresh_request_and_retired_packet_recovers(self):
         bodies = [b'samekey!' + bytes([index]) * 32 for index in range(MAX_CHANNEL_REQUESTS)]
@@ -351,6 +410,12 @@ class HttpMultiplexTest(unittest.IsolatedAsyncioTestCase):
     async def test_telegram_head_501_still_allows_http2_preflight(self):
         self._transport(lambda request: httpx.Response(501, extensions={'http_version': b'HTTP/2'}))
         await self.lane._preflight()
+
+    async def test_missing_http_endpoint_is_rejected_before_native_requests(self):
+        self._transport(lambda request: httpx.Response(
+            404, extensions={'http_version': b'HTTP/2'}))
+        with self.assertRaisesRegex(ConnectionError, 'preflight HTTP 404'):
+            await self.lane._preflight()
 
     async def _packet_bridge(self, *, content_length=True, truncate=False, concurrent_small=False):
         first_chunk_read, release_tail = asyncio.Event(), asyncio.Event()

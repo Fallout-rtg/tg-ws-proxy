@@ -1,7 +1,9 @@
 """Wire-level regressions: real TLS sockets, ALPN and HTTP/2 flow control."""
 import asyncio
 import datetime
+import hashlib
 import ipaddress
+import os
 import ssl
 import struct
 import tempfile
@@ -9,7 +11,7 @@ import time
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 import httpx
 from h2.config import H2Configuration
@@ -19,7 +21,10 @@ from h2.settings import SettingCodes
 
 from proxy.h2_transport import H2Transport, STREAM_RECEIVE_WINDOW, _Connection
 from proxy.cf_h2 import _HttpChannel, _HttpLane, bridge_h2
-from proxy.utils import PROTO_TAG_INTERMEDIATE
+from proxy import tg_ws_proxy
+from proxy._aes import Cipher, algorithms, modes
+from proxy.config import proxy_config
+from proxy.utils import PROTO_TAG_ABRIDGED, PROTO_TAG_INTERMEDIATE, PROTO_TAG_SECURE
 
 
 class H2WireTest(unittest.IsolatedAsyncioTestCase):
@@ -424,6 +429,184 @@ class H2WireTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(await first, b'a' * 65532)
         self.assertEqual(await second, b'b' * 65532)
 
+    async def test_http_404_is_forwarded_while_other_native_channel_keeps_working(self):
+        class Cipher:
+            def update(self, data):
+                return data
+
+        class Writer:
+            def __init__(self):
+                self.data = bytearray()
+                self.changed = asyncio.Event()
+
+            def write(self, data):
+                self.data.extend(data)
+
+            async def drain(self):
+                self.changed.set()
+
+        channel = _HttpChannel(self.lane, 1, 'bad-key-test')
+        reader, writer = asyncio.StreamReader(), Writer()
+        ctx = SimpleNamespace(clt_dec=Cipher(), clt_enc=Cipher())
+        bridge = asyncio.create_task(bridge_h2(reader, writer, channel, ctx, PROTO_TAG_INTERMEDIATE))
+        self.tasks.append(bridge)
+        reader.feed_data(struct.pack('<I', 40) + b'\x00' * 40)
+        self.respond(await asyncio.wait_for(self.requests.get(), 1), b'p' * 84)
+        await asyncio.wait_for(writer.changed.wait(), 1)
+        reader.feed_data((struct.pack('<I', 40) + b'k' * 40) * 2)
+        bad = await asyncio.wait_for(self.requests.get(), 1)
+        pending = await asyncio.wait_for(self.requests.get(), 1)
+        healthy = _HttpChannel(self.lane, 2, 'healthy-key-test')
+        await healthy.send(b'h' * 40, False)
+        good = await asyncio.wait_for(self.requests.get(), 1)
+        self.respond(bad, b'<html>not found</html>', status=404, end=False)
+        await asyncio.wait_for(bridge, 1)
+        self.assertEqual(writer.data, struct.pack('<I', 84) + b'p' * 84
+                         + struct.pack('<Ii', 4, -404))
+        self.assertTrue(channel.close_done)
+        self.assertFalse(channel.pending)
+        self.assertNotIn(pending[1], self.transport.connection.streams)
+        self.assertFalse(healthy.closed)
+        self.respond(good, b'g' * 40)
+        self.assertEqual(await asyncio.wait_for(healthy.receive(), 1), b'g' * 40)
+        recovered = _HttpChannel(self.lane, 3, 'replacement-key-test')
+        await recovered.send(b'n' * 40, False)
+        self.respond(await asyncio.wait_for(self.requests.get(), 1), b'r' * 40)
+        self.assertEqual(await asyncio.wait_for(recovered.receive(), 1), b'r' * 40)
+        self.assertEqual(len(self.connections), 1)
+        self.assertEqual(self.lane.failed_until, 0)
+
+    async def test_binary_transport_error_is_terminal_without_domain_cooldown(self):
+        channel = _HttpChannel(self.lane, 1, 'binary-error-test')
+        await channel.send(b'k' * 40, False)
+        self.respond(await asyncio.wait_for(self.requests.get(), 1), struct.pack('<i', -404))
+        await asyncio.gather(*list(channel.pending))
+        self.assertTrue(channel.closed)
+        self.assertEqual(channel.transport_error, -404)
+        self.assertEqual(self.lane.failed_until, 0)
+        self.assertEqual(self.lane.reply_buffer_bytes, 0)
+        await channel.close()
+
+    async def test_obfuscated_clients_preserve_packets_through_full_h2_fallback(self):
+        secret = os.urandom(16)
+        channels = []
+        clients = []
+        handlers = []
+
+        async def open_channel(dc, label):
+            self.assertEqual(dc, 2)
+            channel = _HttpChannel(self.lane, len(channels) + 1, label)
+            channels.append(channel)
+            return channel
+
+        def accept(reader, writer):
+            task = asyncio.create_task(tg_ws_proxy._handle_client(reader, writer, secret))
+            handlers.append(task)
+            self.tasks.append(task)
+
+        def client_init(tag):
+            raw = bytearray(os.urandom(64))
+            raw[0] = 0x42
+            raw[56:62] = tag + struct.pack('<h', -2)
+            keys = bytes(raw[8:56])
+            up = Cipher(algorithms.AES(hashlib.sha256(keys[:32] + secret).digest()),
+                        modes.CTR(keys[32:])).encryptor()
+            reverse = keys[::-1]
+            down = Cipher(algorithms.AES(hashlib.sha256(reverse[:32] + secret).digest()),
+                          modes.CTR(reverse[32:])).encryptor()
+            encrypted = up.update(bytes(raw))
+            return bytes(raw[:56]) + encrypted[56:], up, down
+
+        def frame(body, tag, padding):
+            if tag == PROTO_TAG_ABRIDGED:
+                words = len(body) // 4
+                prefix = (bytes([words | 0x80]) if words < 127
+                          else b'\xff' + words.to_bytes(3, 'little'))
+            else:
+                if tag == PROTO_TAG_SECURE:
+                    body += os.urandom(padding)
+                prefix = struct.pack('<I', len(body) | 0x80000000)
+            return prefix + body
+
+        async def check_reply(peer, expected, tag):
+            reader, _, _, down = peer
+
+            async def read(count):
+                return down.update(await asyncio.wait_for(reader.readexactly(count), 2))
+
+            if tag == PROTO_TAG_ABRIDGED:
+                words = (await read(1))[0]
+                if words == 127:
+                    words = int.from_bytes(await read(3), 'little')
+                length = words * 4
+            else:
+                length, = struct.unpack('<I', await read(4))
+            body = await read(length)
+            self.assertEqual(body[:len(expected)], expected)
+            self.assertIn(len(body) - len(expected), range(4) if tag == PROTO_TAG_SECURE else (0,))
+
+        server = await asyncio.start_server(accept, '127.0.0.1', 0)
+        pool = SimpleNamespace(open=AsyncMock(side_effect=open_channel))
+        try:
+            with patch.object(tg_ws_proxy, 'cf_h2_pool', pool), \
+                    patch.object(tg_ws_proxy.ws_pool, 'get', AsyncMock(return_value=None)) as direct, \
+                    patch.multiple(proxy_config, fallback_cfproxy=True, cfproxy_worker_domains=[],
+                                   force_test_dc=False, fake_tls_domain='', proxy_protocol=False):
+                for tag in (PROTO_TAG_ABRIDGED, PROTO_TAG_INTERMEDIATE, PROTO_TAG_SECURE):
+                    with self.subTest(tag=tag.hex()):
+                        peers = []
+                        requests = {}
+                        for index in range(2):
+                            reader, writer = await asyncio.open_connection(
+                                '127.0.0.1', server.sockets[0].getsockname()[1])
+                            clients.append(writer)
+                            init, up, down = client_init(tag)
+                            peer = (reader, writer, up, down)
+                            peers.append(peer)
+                            bodies = [b'\x00' * 8 + os.urandom(8) + struct.pack('<I', 20) + os.urandom(20)]
+                            bodies += [b'samekey!' + os.urandom(size - 8) for size in (40, 131112, 56)]
+                            wire = init + up.update(b''.join(
+                                frame(body, tag, padding) for body, padding in zip(bodies, (15, 1, 7, 0))))
+                            for start, end in ((0, 13), (13, 57), (57, 65), (65, 78), (78, len(wire))):
+                                writer.write(wire[start:end])
+                                await writer.drain()
+                                await asyncio.sleep(0)
+                            expected = {body: packet for packet, body in enumerate(bodies)}
+                            for _ in bodies:
+                                request = await asyncio.wait_for(self.requests.get(), 2)
+                                self.assertTrue(request[2] in expected, 'HTTP body differs from native input')
+                                packet = expected.pop(request[2])
+                                requests[index, packet] = request
+
+                        for index, packet in ((1, 2), (0, 2), (0, 0), (1, 0), (0, 1)):
+                            reply = bytes([0x30 + index, packet]) * 36
+                            self.respond(requests[index, packet], reply)
+                            await check_reply(peers[index], reply, tag)
+                        self.respond(requests[0, 3], b'not found', status=404)
+                        await check_reply(peers[0], struct.pack('<i', -404), tag)
+                        self.assertEqual(await asyncio.wait_for(peers[0][0].read(), 2), b'')
+                        self.respond(requests[1, 1], b'healthy!' * 9)
+                        await check_reply(peers[1], b'healthy!' * 9, tag)
+                        self.respond(requests[1, 3], struct.pack('<i', -429))
+                        await check_reply(peers[1], struct.pack('<i', -429), tag)
+                        self.assertEqual(await asyncio.wait_for(peers[1][0].read(), 2), b'')
+                await asyncio.wait_for(asyncio.gather(*handlers), 2)
+                self.assertEqual(direct.await_count, 6)
+                for call in direct.await_args_list:
+                    self.assertEqual(call.args, (2, True))
+                    self.assertEqual(call.kwargs, {'is_test_dc': False})
+                self.assertEqual(pool.open.await_count, 6)
+                self.assertTrue(all(channel.close_done and not channel.pending for channel in channels))
+                self.assertTrue(all(channel.quick_requests == 4 for channel in channels))
+                self.assertEqual(len(self.connections), 1)
+                self.assertEqual(self.lane.failed_until, 0)
+        finally:
+            for writer in clients:
+                writer.close()
+                await writer.wait_closed()
+            server.close()
+            await server.wait_closed()
+
     async def test_file_chunk_fits_first_window_without_extra_network_round_trip(self):
         # A 128 KiB file part plus its MTProto envelope must fit before any
         # WINDOW_UPDATE arrives. This matters even when the consumer is fast.
@@ -819,6 +1002,47 @@ class H2WireTest(unittest.IsolatedAsyncioTestCase):
             await bad
         self.respond(good_request)
         self.assertEqual(await good, b'r' * 40)
+
+    async def test_reset_during_response_closes_native_bridge_without_escaping(self):
+        cipher = SimpleNamespace(update=lambda data: data)
+        ctx = SimpleNamespace(clt_dec=cipher, clt_enc=cipher)
+        output = bytearray()
+        writer = SimpleNamespace(write=output.extend, drain=AsyncMock())
+        reader = asyncio.StreamReader()
+        reader.feed_data(struct.pack('<I', 40) + b'k' * 40)
+        channel = _HttpChannel(self.lane, 1, 'reset-during-body')
+
+        with patch.object(channel, '_recover', side_effect=asyncio.Event().wait), \
+                self.assertLogs('tg-mtproto-proxy', level='DEBUG') as captured:
+            bridge = asyncio.create_task(bridge_h2(reader, writer, channel, ctx, PROTO_TAG_INTERMEDIATE))
+            self.tasks.append(bridge)
+            request = await asyncio.wait_for(self.requests.get(), 1)
+            healthy, good_request = await self.post(b'h' * 40)
+            self.respond(request, b'partial-response!!!!', end=False, length=40)
+
+            async def body_received():
+                while self.lane.reply_buffer_bytes != 20:
+                    await asyncio.sleep(.001)
+
+            await asyncio.wait_for(body_received(), 1)
+            conn, sid, _ = request
+            conn.h2.reset_stream(sid, error_code=2)
+            self.flush(conn)
+            await asyncio.wait_for(bridge, 1)
+            self.assertTrue(channel.close_done)
+            self.assertFalse(channel.pending)
+            self.assertIsNone(channel.transport_error)
+            self.assertFalse(output, 'A partial HTTP response must never reach the native client')
+            self.assertEqual(self.lane.reply_buffer_bytes, 0)
+            self.assertIsNone(self.transport.connection.error)
+            self.respond(good_request)
+            self.assertEqual(await asyncio.wait_for(healthy, 1), b'r' * 40)
+            self.assertEqual(len(self.connections), 1)
+        failures = [record for record in captured.records if record.levelname in ('WARNING', 'ERROR')]
+        self.assertEqual(len(failures), 1)
+        self.assertIn('reset: 2', failures[0].getMessage())
+        self.assertIn('down=20', failures[0].getMessage())
+        self.assertIn('sid=1', failures[0].getMessage())
 
     async def test_connection_loss_fails_waiters_and_next_request_reconnects(self):
         tasks = [await self.post() for _ in range(3)]
