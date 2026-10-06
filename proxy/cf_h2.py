@@ -16,7 +16,7 @@ from .h2_transport import H2Transport
 from .stats import stats
 from .utils import (
     DC_DEFAULT_IPS, PROTO_TAG_ABRIDGED,
-    PROTO_TAG_SECURE, create_ssl_context,
+    PROTO_TAG_SECURE,
 )
 
 log = logging.getLogger('tg-mtproto-proxy')
@@ -616,7 +616,7 @@ class _HttpLane:
         self.reply_buffer_bytes = 0
         self.capacity = asyncio.Condition()
         self.client = httpx.AsyncClient(
-            transport=H2Transport(create_ssl_context(), max_streams=MAX_LANE_REQUESTS),
+            transport=H2Transport(max_streams=MAX_LANE_REQUESTS),
             trust_env=False,
             timeout=httpx.Timeout(REQUEST_TIMEOUT, connect=8, pool=REQUEST_TIMEOUT),
         )

@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import time
 from collections import deque
+from functools import lru_cache
 
 import httpx
 from h2.config import H2Configuration
@@ -15,8 +16,17 @@ from h2.events import (
 from h2.exceptions import H2Error, StreamClosedError
 from h2.settings import SettingCodes, Settings
 
+from .utils import create_ssl_context
+
 STREAM_RECEIVE_WINDOW = 256 * 1024
 CONNECTION_RECEIVE_WINDOW = 4 * 1024 * 1024
+
+
+@lru_cache(maxsize=1)
+def _default_ssl_context():
+    context = create_ssl_context()
+    context.set_alpn_protocols(['h2'])
+    return context
 
 
 class _ResponseStream(httpx.AsyncByteStream):
@@ -278,9 +288,12 @@ class _Connection:
 
 
 class H2Transport(httpx.AsyncBaseTransport):
-    def __init__(self, ssl_context, max_streams=64):
-        self.ssl_context = ssl_context
-        self.ssl_context.set_alpn_protocols(['h2'])
+    def __init__(self, ssl_context=None, max_streams=64):
+        if ssl_context is None:
+            self.ssl_context = _default_ssl_context()
+        else:
+            self.ssl_context = ssl_context
+            self.ssl_context.set_alpn_protocols(['h2'])
         self.max_streams = max_streams
         self.connection = None
         self.origin = None

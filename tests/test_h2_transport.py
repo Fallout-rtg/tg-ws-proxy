@@ -27,6 +27,40 @@ from proxy.config import proxy_config
 from proxy.utils import PROTO_TAG_ABRIDGED, PROTO_TAG_INTERMEDIATE, PROTO_TAG_SECURE
 
 
+class H2ContextTest(unittest.IsolatedAsyncioTestCase):
+    async def test_lanes_reuse_verified_context_without_changing_websocket_contexts(self):
+        from proxy.h2_transport import _default_ssl_context
+        from proxy.raw_websocket import _ssl_ctx, _ssl_ctx_fronting
+        from proxy.utils import create_ssl_context
+
+        _default_ssl_context.cache_clear()
+        self.addCleanup(_default_ssl_context.cache_clear)
+        lanes = []
+        try:
+            with patch('proxy.h2_transport.create_ssl_context', wraps=create_ssl_context) as create:
+                lanes = [_HttpLane('kws4.example.org', 1), _HttpLane('kws2.example.net', 2)]
+                create.assert_called_once_with()
+            first, second = (lane.client._transport.ssl_context for lane in lanes)
+            self.assertIs(first, second)
+            self.assertIsNot(first, _ssl_ctx)
+            self.assertIsNot(first, _ssl_ctx_fronting)
+            self.assertTrue(first.check_hostname)
+            self.assertEqual(first.verify_mode, ssl.CERT_REQUIRED)
+            self.assertTrue(_ssl_ctx.check_hostname)
+            self.assertFalse(_ssl_ctx_fronting.check_hostname)
+            self.assertEqual(set(first.get_ca_certs(binary_form=True)),
+                             set(_ssl_ctx.get_ca_certs(binary_form=True)))
+
+            custom = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+            custom.check_hostname = False
+            transport = H2Transport(custom)
+            self.assertIs(transport.ssl_context, custom)
+            self.assertTrue(first.check_hostname)
+            await transport.aclose()
+        finally:
+            await asyncio.gather(*(lane.close() for lane in lanes))
+
+
 class H2WireTest(unittest.IsolatedAsyncioTestCase):
     @classmethod
     def setUpClass(cls):
@@ -162,6 +196,14 @@ class H2WireTest(unittest.IsolatedAsyncioTestCase):
         self.respond(request2)
         await asyncio.gather(slow1, slow2)
         self.assertEqual(len(self.connections), 1)
+
+    async def test_shared_default_context_rejects_untrusted_certificate(self):
+        async with httpx.AsyncClient(transport=H2Transport(), trust_env=False) as client:
+            with self.assertRaises(httpx.ConnectError):
+                await client.get('https://' + self.lane.host + '/api')
+        task, request = await self.post()
+        self.respond(request)
+        self.assertEqual(await asyncio.wait_for(task, 1), b'r' * 40)
 
     async def test_debug_trace_follows_real_stream_without_logging_payload(self):
         channel = _HttpChannel(self.lane, 1, 'trace-test')

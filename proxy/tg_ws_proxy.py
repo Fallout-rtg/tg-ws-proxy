@@ -299,7 +299,7 @@ async def _handle_client(reader, writer, secret: bytes):
                      label, dc, media_tag)
             splitter_fb = None
             try:
-                splitter_fb = MsgSplitter(relay_init, proto_int)
+                splitter_fb = MsgSplitter(proto_int)
             except Exception:
                 pass
             ok = await do_fallback(
@@ -317,7 +317,7 @@ async def _handle_client(reader, writer, secret: bytes):
 
         splitter = None
         try:
-            splitter = MsgSplitter(relay_init, proto_int)
+            splitter = MsgSplitter(proto_int)
             log.debug("[%s] MsgSplitter activated for proto 0x%08X",
                       label, proto_int)
         except Exception:
