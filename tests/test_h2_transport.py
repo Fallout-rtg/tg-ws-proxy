@@ -1016,8 +1016,8 @@ class H2WireTest(unittest.IsolatedAsyncioTestCase):
         self.respond(request, b's' * (1024 * 1024))
         response = await opening
         fast, fast_request = await self.post()
-        self.respond(fast_request, b'f' * (128 * 1024))
-        self.assertEqual(await asyncio.wait_for(fast, .5), b'f' * (128 * 1024))
+        self.respond(fast_request, b'f' * (4 * 1024 * 1024))
+        self.assertEqual(await asyncio.wait_for(fast, 2), b'f' * (4 * 1024 * 1024))
         stream = self.transport.connection.streams[request[1]]
         self.assertLessEqual(sum(len(data) for data, _ in stream.chunks), STREAM_RECEIVE_WINDOW)
         await response.aclose()
