@@ -6,6 +6,8 @@ LOCALES_DIR = Path(__file__).parents[1] / "ui" / "i18n"
 
 # Values that are intentionally identical across locales
 # (brand names, technical terms, format-only strings).
+# Note: settings.language is deliberately "Language" in ru.json —
+# upstream keeps the language selector label in English on purpose.
 ALLOWED_UNTRANSLATED = frozenset({
     "app.name",
     "button.test_loading",
@@ -16,6 +18,7 @@ ALLOWED_UNTRANSLATED = frozenset({
     "language.ru",
     "section.cfproxy",
     "section.cfworker",
+    "settings.language",
 })
 
 
