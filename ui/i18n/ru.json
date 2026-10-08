@@ -12,7 +12,7 @@
   "appearance.dark": "Тёмная",
 
   "settings.title": "Настройки",
-  "settings.language": "Language",
+  "settings.language": "Язык",
   "settings.theme": "Тема",
 
   "section.interface": "Интерфейс",
@@ -28,7 +28,7 @@
 
   "label.host": "IP-адрес",
   "label.port": "Порт",
-  "label.secret": "Secret",
+  "label.secret": "Секрет",
   "label.dc_hint": "По одному правилу на строку, формат: номер:IP",
   "label.cf_enable": "Включить CF-прокси",
   "label.cf_custom_domain": "Свой домен",
@@ -69,6 +69,7 @@
   "button.update": "Обновить",
   "button.page": "Страница",
   "button.close": "Закрыть",
+  "button.donate": "Поддержать ♥",
 
   "validation.bad_host": "Некорректный IP-адрес.",
   "validation.bad_port": "Порт должен быть числом 1-65535",
@@ -109,7 +110,7 @@
   "first_run.manual": "  Вручную:",
   "first_run.manual_path": "  Настройки → Продвинутые → Тип подключения → Прокси",
   "first_run.manual_mtproto": "  MTProto → {host} : {port}",
-  "first_run.manual_secret": "  Secret: dd{secret}",
+  "first_run.manual_secret": "  Секрет: dd{secret}",
   "first_run.open_now": "Открыть прокси в Telegram сейчас",
 
   "tray.open_telegram": "Открыть в Telegram ({host}:{port})",
