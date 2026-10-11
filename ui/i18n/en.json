@@ -67,6 +67,7 @@
   "button.open_release": "Open release page",
   "button.start": "Get started",
   "button.update": "Update",
+  "button.check_updates": "Check for updates",
   "button.page": "Page",
   "button.close": "Close",
   "button.donate": "Donate ♥",
@@ -97,7 +98,8 @@
   "connectivity.multi_partial": "~ {domain}: working {ok_list}; unreachable {fail_list}",
 
   "updates.status_error": "Could not reach GitHub. Check your network.",
-  "updates.status_pending": "Status will appear after the background check on startup.",
+  "updates.status_pending": "Updates have not been checked yet.",
+  "updates.status_checking": "Checking for updates...",
   "updates.status_available": "Version {latest} is available on GitHub (you have {current}).",
   "updates.status_ahead": "You have {current} — newer than the latest GitHub release ({latest}).",
   "updates.status_latest": "Latest known version from GitHub is installed.",

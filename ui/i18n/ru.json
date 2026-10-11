@@ -67,6 +67,7 @@
   "button.open_release": "Открыть страницу релиза",
   "button.start": "Начать",
   "button.update": "Обновить",
+  "button.check_updates": "Проверить обновления",
   "button.page": "Страница",
   "button.close": "Закрыть",
   "button.donate": "Поддержать ♥",
@@ -97,7 +98,8 @@
   "connectivity.multi_partial": "~ {domain}: работают {ok_list}; недоступны {fail_list}",
 
   "updates.status_error": "Не удалось связаться с GitHub. Проверьте сеть.",
-  "updates.status_pending": "Статус появится после фоновой проверки при запуске.",
+  "updates.status_pending": "Обновления ещё не проверялись.",
+  "updates.status_checking": "Проверка обновлений...",
   "updates.status_available": "На GitHub доступна версия {latest} (у вас {current}).",
   "updates.status_ahead": "У вас {current} — новее последнего релиза на GitHub ({latest}).",
   "updates.status_latest": "Установлена последняя известная версия с GitHub.",
