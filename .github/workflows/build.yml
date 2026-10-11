@@ -12,6 +12,11 @@ on:
         description: "Release version tag (e.g. v1.0.0)"
         required: false
         default: "v1.0.0"
+      sign_windows:
+        description: 'Sign?'
+        type: boolean
+        required: false
+        default: true
       build_windows_x64:
         description: 'Build Windows x64?'
         type: boolean
@@ -104,6 +109,7 @@ jobs:
         run: mv dist/TgWsProxy.exe dist/TgWsProxy_windows.exe
 
       - name: Upload unsigned artifact
+        if: ${{ inputs.sign_windows }}
         id: upload-unsigned
         uses: actions/upload-artifact@v7
         with:
@@ -113,6 +119,7 @@ jobs:
           if-no-files-found: error
 
       - name: Sign EXE with SignPath
+        if: ${{ inputs.sign_windows }}
         uses: signpath/github-action-submit-signing-request@v3
         with:
           api-token: ${{ secrets.SIGNPATH_API_TOKEN }}
@@ -124,11 +131,11 @@ jobs:
           wait-for-completion: true
           output-artifact-directory: signed
 
-      - name: Upload signed artifact
+      - name: Upload Windows artifact
         uses: actions/upload-artifact@v7
         with:
           name: TgWsProxy-windows-x64
-          path: signed/TgWsProxy_windows.exe
+          path: ${{ inputs.sign_windows && 'signed' || 'dist' }}/TgWsProxy_windows.exe
           archive: true
           if-no-files-found: error
 
@@ -204,6 +211,7 @@ jobs:
         run: mv dist/TgWsProxy.exe dist/TgWsProxy_windows_arm64.exe
 
       - name: Upload unsigned artifact
+        if: ${{ inputs.sign_windows }}
         id: upload-unsigned
         uses: actions/upload-artifact@v7
         with:
@@ -213,6 +221,7 @@ jobs:
           if-no-files-found: error
 
       - name: Sign EXE with SignPath
+        if: ${{ inputs.sign_windows }}
         uses: signpath/github-action-submit-signing-request@v3
         with:
           api-token: ${{ secrets.SIGNPATH_API_TOKEN }}
@@ -224,11 +233,11 @@ jobs:
           wait-for-completion: true
           output-artifact-directory: signed
 
-      - name: Upload signed artifact
+      - name: Upload Windows artifact
         uses: actions/upload-artifact@v7
         with:
           name: TgWsProxy-windows-arm64
-          path: signed/TgWsProxy_windows_arm64.exe
+          path: ${{ inputs.sign_windows && 'signed' || 'dist' }}/TgWsProxy_windows_arm64.exe
           archive: true
           if-no-files-found: error
 
@@ -281,6 +290,7 @@ jobs:
         run: mv dist/TgWsProxy.exe dist/TgWsProxy_windows_7_${{ matrix.suffix }}.exe
 
       - name: Upload unsigned artifact
+        if: ${{ inputs.sign_windows }}
         id: upload-unsigned
         uses: actions/upload-artifact@v7
         with:
@@ -290,6 +300,7 @@ jobs:
           if-no-files-found: error
 
       - name: Sign EXE with SignPath
+        if: ${{ inputs.sign_windows }}
         uses: signpath/github-action-submit-signing-request@v3
         with:
           api-token: ${{ secrets.SIGNPATH_API_TOKEN }}
@@ -301,11 +312,11 @@ jobs:
           wait-for-completion: true
           output-artifact-directory: signed
 
-      - name: Upload signed artifact
+      - name: Upload Windows artifact
         uses: actions/upload-artifact@v7
         with:
           name: TgWsProxy-win7-${{ matrix.suffix }}
-          path: signed/TgWsProxy_windows_7_${{ matrix.suffix }}.exe
+          path: ${{ inputs.sign_windows && 'signed' || 'dist' }}/TgWsProxy_windows_7_${{ matrix.suffix }}.exe
           archive: true
           if-no-files-found: error
 
