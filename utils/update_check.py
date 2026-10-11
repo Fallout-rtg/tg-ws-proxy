@@ -106,7 +106,7 @@ def download_asset(
     if not expected:
         raise ValueError("The release asset has no valid SHA-256 checksum")
 
-    fd, name = tempfile.mkstemp(dir=str(dest_dir), suffix=suffix)
+    fd, name = tempfile.mkstemp(dir=str(dest_dir), suffix=suffix, prefix="TgWsProxy_tmp_")
     path = Path(name)
     try:
         sha = hashlib.sha256()

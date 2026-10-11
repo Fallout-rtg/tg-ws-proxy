@@ -148,7 +148,7 @@ def update_ctk_form(
             width=310 if asset else 210,
             height=130 if asset else 100,
             theme=theme,
-            topmost=False,
+            topmost=True,
             after_create=lambda r: r.iconbitmap(ICON_PATH),
         )
         frame = main_content_frame(ctk, root, theme, padx=16, pady=14)
